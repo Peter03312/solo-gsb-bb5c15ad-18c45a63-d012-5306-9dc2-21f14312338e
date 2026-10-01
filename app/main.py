@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from .config import get_settings
 from .db import Database
 from .schemas import PointBatch, ZoneCreate
-from .service import AuditService, ConflictError, ValidationError
+from .service import AuditService, ConflictError, NotFoundError, ValidationError
 
 settings = get_settings()
 db = Database(settings)
@@ -26,11 +26,12 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="工地作业车危险区穿越审计服务",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
     description=(
-        "登记带洞米制多边形危险区及其 UTC 半开生效时段；批量提交车辆轨迹点，"
-        "查询各危险区的穿越区间与累计时长。"
+        "登记带洞米制多边形危险区及其 UTC 半开生效时段；每次登记/同 ID 覆盖更新原子地"
+        "产生全局递增修订号并保存不可变历史版本。批量提交车辆轨迹点，可按最新配置或"
+        "指定修订号复现历史穿越审计。"
     ),
 )
 
@@ -45,9 +46,14 @@ async def _conflict_handler(_: Request, exc: ConflictError) -> JSONResponse:
     return JSONResponse(status_code=409, content={"error": "conflict", "detail": str(exc)})
 
 
+@app.exception_handler(NotFoundError)
+async def _not_found_handler(_: Request, exc: NotFoundError) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"error": "not_found", "detail": str(exc)})
+
+
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok"}
+    return {"status": "ok", "current_revision": service.current_revision()}
 
 
 @app.get("/")
@@ -60,6 +66,7 @@ def index() -> dict:
             "POST /api/v1/zones",
             "GET  /api/v1/zones",
             "GET  /api/v1/zones/{zone_id}",
+            "GET  /api/v1/revisions",
             "POST /api/v1/trips/{trip_id}/points",
             "GET  /api/v1/trips/{trip_id}",
             "GET  /api/v1/trips/{trip_id}/crossings",
@@ -73,18 +80,47 @@ def create_zone(body: ZoneCreate) -> dict:
 
 
 @app.get("/api/v1/zones")
-def list_zones() -> dict:
-    return {"zones": service.list_zones()}
+def list_zones(
+    revision: Optional[int] = Query(
+        default=None,
+        ge=1,
+        description="指定修订号：列出截至该号各区的最后版本；不传则返回最新配置",
+    ),
+) -> dict:
+    return service.list_zones(revision)
 
 
 @app.get("/api/v1/zones/{zone_id}")
-def get_zone(zone_id: str) -> JSONResponse:
-    detail = service.get_zone(zone_id)
+def get_zone(
+    zone_id: str,
+    revision: Optional[int] = Query(
+        default=None,
+        ge=1,
+        description="指定修订号：返回该区截至该号的最后版本；不传则返回最新版本",
+    ),
+) -> JSONResponse:
+    detail = service.get_zone(zone_id, revision)
     if detail is None:
+        if revision is not None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "not_found",
+                    "detail": f"修订号 {revision} 时尚未登记危险区: {zone_id}",
+                },
+            )
         return JSONResponse(
             status_code=404, content={"error": "not_found", "detail": f"危险区不存在: {zone_id}"}
         )
     return JSONResponse(content=detail)
+
+
+@app.get("/api/v1/revisions")
+def list_revisions(
+    limit: int = Query(default=500, ge=1, le=10000, description="最多返回条数（按修订号倒序）"),
+) -> dict:
+    """全局修订流水：修订号、对应危险区 ID、登记时刻。"""
+    return service.list_revisions(limit=limit)
 
 
 @app.post("/api/v1/trips/{trip_id}/points")
@@ -127,8 +163,15 @@ def get_crossings(
     zone_id: Optional[str] = Query(default=None),
     since: Optional[str] = Query(default=None, description="只统计该 UTC 时刻（含）之后"),
     until: Optional[str] = Query(default=None, description="只统计该 UTC 时刻（不含）之前"),
+    revision: Optional[int] = Query(
+        default=None,
+        ge=1,
+        description="按指定修订号复现：取各区截至该号的最后版本；不传则用最新配置",
+    ),
 ) -> dict:
-    return service.query_crossings(trip_id, zone_id=zone_id, since=since, until=until)
+    return service.query_crossings(
+        trip_id, zone_id=zone_id, since=since, until=until, revision=revision
+    )
 
 
 if __name__ == "__main__":

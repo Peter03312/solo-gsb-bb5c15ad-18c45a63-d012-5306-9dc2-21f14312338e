@@ -19,9 +19,11 @@ def _clean_tables():
     from app.main import db as _db
 
     with _db.transaction() as conn:
-        conn.execute("DELETE FROM zone_windows")
-        conn.execute("DELETE FROM zones")
+        conn.execute("DELETE FROM zone_version_windows")
+        conn.execute("DELETE FROM zone_versions")
+        conn.execute("DELETE FROM revisions")
         conn.execute("DELETE FROM points")
+        conn.execute("DELETE FROM sqlite_sequence WHERE name = 'revisions'")
     yield
 
 
