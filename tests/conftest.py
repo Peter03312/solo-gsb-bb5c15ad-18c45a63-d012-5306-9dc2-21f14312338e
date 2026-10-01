@@ -18,10 +18,7 @@ def _clean_tables():
     """每个测试前清空数据（保留表结构），保证用例相互隔离。"""
     from app.main import db as _db
 
-    with _db.transaction() as conn:
-        conn.execute("DELETE FROM zone_windows")
-        conn.execute("DELETE FROM zones")
-        conn.execute("DELETE FROM points")
+    _db.clear_all_for_tests()
     yield
 
 

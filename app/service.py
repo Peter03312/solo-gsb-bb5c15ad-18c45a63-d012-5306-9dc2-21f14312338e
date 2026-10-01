@@ -1,4 +1,4 @@
-"""业务服务：危险区登记、轨迹点批量提交、穿越审计计算。"""
+"""业务服务：危险区登记（全局修订号）、轨迹点批量提交、穿越审计计算。"""
 from __future__ import annotations
 
 import json
@@ -21,14 +21,70 @@ class ValidationError(Exception):
     """语义校验失败（HTTP 400）。"""
 
 
+class NotFoundError(Exception):
+    """资源不存在或修订号超出范围（HTTP 404）。"""
+
+
 def _iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _validate_revision_param(raw: Any) -> int:
+    """校验查询参数 revision：必须是 >=1 的整数。"""
+    if isinstance(raw, bool):
+        raise ValidationError(f"revision 必须是正整数，收到: {raw!r}")
+    if isinstance(raw, int):
+        value = raw
+    else:
+        text = str(raw).strip()
+        try:
+            value = int(text)
+        except (TypeError, ValueError):
+            raise ValidationError(f"revision 必须是正整数，收到: {raw!r}")
+    if value < 1:
+        raise ValidationError(f"revision 必须是正整数（>=1），收到: {value}")
+    return value
+
+
+def _row_to_zone(row: Any, *, include_revision: bool = True) -> Dict[str, Any]:
+    windows_raw = json.loads(row["windows"])
+    body: Dict[str, Any] = {
+        "zone_id": row["zone_id"],
+        "exterior": json.loads(row["exterior"]),
+        "holes": json.loads(row["holes"]),
+        "windows": [
+            {"start": w["start_iso"], "end": w["end_iso"]} for w in windows_raw
+        ],
+        "created_at": row["created_at"],
+        "registered_at": row["registered_at"],
+    }
+    if include_revision:
+        body["revision"] = int(row["revision"])
+    return body
 
 
 class AuditService:
     def __init__(self, db: Database) -> None:
         self.db = db
         self.min_duration = db.settings.min_duration
+
+    # ------------------------------------------------------------------
+    # 修订号
+    # ------------------------------------------------------------------
+
+    def current_revision(self) -> int:
+        return self.db.current_revision()
+
+    def _resolve_revision(self, raw: Any) -> int:
+        """校验并解析调用方指定的修订号；超出当前范围明确报错 404。"""
+        revision = _validate_revision_param(raw)
+        head = self.db.current_revision()
+        if revision > head:
+            raise NotFoundError(
+                f"修订号 {revision} 超出当前范围：当前最新修订号为 {head}"
+                + ("（尚无任何区域登记）" if head == 0 else "")
+            )
+        return revision
 
     # ------------------------------------------------------------------
     # 危险区登记
@@ -71,54 +127,88 @@ class AuditService:
                 }
             )
 
-        existing = self.db.get_zone_row(zone_id)
-        created = existing is None
         now_iso = _iso_z(datetime.now(timezone.utc))
+        # 单事务：读取既有首版 created_at + 追加不可变版本 + 分配全局修订号，原子提交
         with self.db.transaction() as conn:
-            if existing:
-                conn.execute("DELETE FROM zone_windows WHERE zone_id = ?", (zone_id,))
-                conn.execute("DELETE FROM zones WHERE zone_id = ?", (zone_id,))
-            self.db.insert_zone(
+            first = self.db.first_zone_revision(conn, zone_id)
+            created = first is None
+            created_iso = now_iso if created else first["created_at"]
+            revision = self.db.insert_zone_revision(
                 conn,
                 zone_id,
                 [list(c) for c in polygon.exterior.coords],
                 [[list(c) for c in ring.coords] for ring in polygon.interiors],
                 windows,
-                existing["created_at"] if existing else now_iso,
+                created_iso,
+                now_iso,
             )
 
         return {
             "zone_id": zone_id,
+            "revision": revision,
             "status": "created" if created else "updated",
             "num_holes": len(polygon.interiors),
             "num_windows": len(windows),
         }
 
-    def get_zone(self, zone_id: str) -> Optional[Dict[str, Any]]:
-        row = self.db.get_zone_row(zone_id)
+    def get_zone(self, zone_id: str, revision_raw: Any = None) -> Optional[Dict[str, Any]]:
+        if revision_raw is None:
+            row = self.db.latest_zone_row(zone_id)
+            if row is None:
+                return None
+            return _row_to_zone(row)
+
+        revision = self._resolve_revision(revision_raw)
+        with self.db.read_view() as conn:
+            row = self.db._zone_row_at(conn, zone_id, revision)
         if row is None:
-            return None
-        cur = self.db.conn.execute(
-            "SELECT start_iso, end_iso FROM zone_windows WHERE zone_id = ? ORDER BY start_epoch",
-            (zone_id,),
-        )
+            # 指定版本中该区尚未登记
+            raise NotFoundError(
+                f"修订号 {revision} 的配置中危险区尚未登记: {zone_id}"
+            )
+        return _row_to_zone(row)
+
+    def list_zones(self, revision_raw: Any = None) -> Dict[str, Any]:
+        if revision_raw is None:
+            rows = self.db.list_latest_zone_rows()
+            return {"zones": [_row_to_zone(r) for r in rows]}
+
+        revision = self._resolve_revision(revision_raw)
+        with self.db.read_view() as conn:
+            rows = self.db._list_zone_rows_at(conn, revision)
         return {
-            "zone_id": row["zone_id"],
-            "exterior": json.loads(row["exterior"]),
-            "holes": json.loads(row["holes"]),
-            "windows": [
-                {"start": r["start_iso"], "end": r["end_iso"]} for r in cur.fetchall()
-            ],
-            "created_at": row["created_at"],
+            "revision": revision,
+            "zones": [_row_to_zone(r) for r in rows],
         }
 
-    def list_zones(self) -> List[Dict[str, Any]]:
-        result = []
-        for row in self.db.list_zone_rows():
-            detail = self.get_zone(row["zone_id"])
-            assert detail is not None
-            result.append(detail)
-        return result
+    def list_revisions(self, zone_id: Optional[str] = None, limit: int = 500) -> Dict[str, Any]:
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > 10000:
+            raise ValidationError("limit 必须是 1..10000 的整数")
+        if zone_id is None:
+            rows = self.db.list_revision_rows(limit=limit)
+            payload = {
+                "current_revision": self.db.current_revision(),
+                "revisions": [self._revision_brief(r) for r in rows],
+            }
+            return payload
+        # 按区查看：区当前必须存在（历史曾登记即视为存在，版本不可删除）
+        existing = self.db.latest_zone_row(zone_id)
+        if existing is None:
+            raise NotFoundError(f"危险区不存在: {zone_id}")
+        rows = self.db.list_zone_revision_rows(zone_id)
+        return {
+            "zone_id": zone_id,
+            "revisions": [self._revision_brief(r) for r in rows],
+        }
+
+    @staticmethod
+    def _revision_brief(row: Any) -> Dict[str, Any]:
+        return {
+            "revision": int(row["revision"]),
+            "zone_id": row["zone_id"],
+            "created_at": row["created_at"],
+            "registered_at": row["registered_at"],
+        }
 
     # ------------------------------------------------------------------
     # 轨迹点批量提交（幂等 / 冲突）
@@ -238,6 +328,7 @@ class AuditService:
         zone_id: Optional[str] = None,
         since: Optional[str] = None,
         until: Optional[str] = None,
+        revision_raw: Any = None,
     ) -> Dict[str, Any]:
         try:
             lo = parse_utc(since, field="since").timestamp() if since else None
@@ -247,77 +338,102 @@ class AuditService:
         if lo is not None and hi is not None and lo >= hi:
             raise ValidationError("since 必须早于 until（查询范围为半开 [since, until)）")
 
-        points = self.db.list_trip_points(trip_id)
-        if len(points) < 2:
-            return {
-                "trip_id": trip_id,
-                "point_count": len(points),
-                "zones": [],
-            }
+        pinned = revision_raw is not None
+        revision = self._resolve_revision(revision_raw) if pinned else None
 
-        zone_rows = self.db.list_zone_rows()
-        if zone_id is not None:
-            zone_rows = [r for r in zone_rows if r["zone_id"] == zone_id]
-            if not zone_rows:
-                raise ValidationError(f"危险区不存在: {zone_id}")
-
-        # points 已在 SQL 层按时刻排序，乱序上传在此完成重建
-
-        zone_results: List[Dict[str, Any]] = []
-        for zrow in zone_rows:
-            polygon = Polygon(
-                json.loads(zrow["exterior"]),
-                json.loads(zrow["holes"]),
-            )
-            windows = merge_windows(self.db.get_windows(zrow["zone_id"]))
-
-            # 覆盖参数（时间）区间：遍历相邻点，乱序已在 SQL 层按时刻排序重建
-            cover: List[Tuple[float, float]] = []
-            for a, b in zip(points, points[1:]):
-                t0, t1 = a["ts_epoch"], b["ts_epoch"]
-                if t1 <= t0:
-                    # 同刻点不应出现（唯一约束），稳妥跳过
-                    continue
-                params = segment_inside_params(
-                    polygon, (a["x"], a["y"]), (b["x"], b["y"])
-                )
-                for pa, pb in params:
-                    # 参数 0/1 直接取端点时刻，保证相邻段在公共采样点精确相接
-                    s = t0 if pa == 0.0 else t0 + pa * (t1 - t0)
-                    e = t1 if pb == 1.0 else t0 + pb * (t1 - t0)
-                    if e - s > self.min_duration:
-                        cover.append((s, e))
-
-            # 时间域合并留 1e-6 秒容差，吸收不同时刻解析路径的浮点误差
-            cover = merge_intervals(cover, eps=1e-6)
-            intervals = clip_intervals_halfopen(cover, windows)
-            if lo is not None or hi is not None:
-                bounds = [(-float("inf") if lo is None else lo, float("inf") if hi is None else hi)]
-                intervals = clip_intervals_halfopen(intervals, bounds)
-            intervals = merge_intervals(intervals, eps=1e-6)
-            intervals = [(s, e) for s, e in intervals if e - s > self.min_duration]
-
-            segments = [
-                {
-                    "start": _iso_z(datetime.fromtimestamp(s, timezone.utc)),
-                    "end": _iso_z(datetime.fromtimestamp(e, timezone.utc)),
-                    "duration_sec": round(e - s, 6),
+        with self.db.read_view() as conn:
+            points = self.db._list_trip_points(conn, trip_id)
+            if len(points) < 2:
+                result: Dict[str, Any] = {
+                    "trip_id": trip_id,
+                    "point_count": len(points),
+                    "zones": [],
                 }
-                for s, e in intervals
-            ]
-            total = round(sum(e - s for s, e in intervals), 6)
+                if pinned:
+                    result["revision"] = revision
+                return result
 
-            zone_results.append(
-                {
-                    "zone_id": zrow["zone_id"],
-                    "crossed": bool(intervals),
-                    "total_duration_sec": total,
-                    "segments": segments,
-                }
-            )
+            if pinned:
+                zone_rows = self.db._list_zone_rows_at(conn, revision)
+            else:
+                zone_rows = self.db._list_latest_zone_rows(conn)
+            if zone_id is not None:
+                zone_rows = [r for r in zone_rows if r["zone_id"] == zone_id]
+                if not zone_rows:
+                    if pinned:
+                        # 指定版本中尚未登记的区域不参与核算
+                        raise NotFoundError(
+                            f"修订号 {revision} 的配置中危险区尚未登记: {zone_id}"
+                        )
+                    raise ValidationError(f"危险区不存在: {zone_id}")
 
-        return {
+            zone_results: List[Dict[str, Any]] = []
+            for zrow in zone_rows:
+                zone_result = self._crossing_for_zone(zrow, points, lo, hi)
+                zone_results.append(zone_result)
+
+        result = {
             "trip_id": trip_id,
             "point_count": len(points),
             "zones": zone_results,
+        }
+        if pinned:
+            result["revision"] = revision
+        return result
+
+    def _crossing_for_zone(
+        self,
+        zrow: Any,
+        points: List[Any],
+        lo: Optional[float],
+        hi: Optional[float],
+    ) -> Dict[str, Any]:
+        polygon = Polygon(
+            json.loads(zrow["exterior"]),
+            json.loads(zrow["holes"]),
+        )
+        windows_raw = json.loads(zrow["windows"])
+        windows = merge_windows([(w["start_epoch"], w["end_epoch"]) for w in windows_raw])
+
+        # 覆盖参数（时间）区间：遍历相邻点，乱序已在 SQL 层按时刻排序重建
+        cover: List[Tuple[float, float]] = []
+        for a, b in zip(points, points[1:]):
+            t0, t1 = a["ts_epoch"], b["ts_epoch"]
+            if t1 <= t0:
+                # 同刻点不应出现（唯一约束），稳妥跳过
+                continue
+            params = segment_inside_params(
+                polygon, (a["x"], a["y"]), (b["x"], b["y"])
+            )
+            for pa, pb in params:
+                # 参数 0/1 直接取端点时刻，保证相邻段在公共采样点精确相接
+                s = t0 if pa == 0.0 else t0 + pa * (t1 - t0)
+                e = t1 if pb == 1.0 else t0 + pb * (t1 - t0)
+                if e - s > self.min_duration:
+                    cover.append((s, e))
+
+        # 时间域合并留 1e-6 秒容差，吸收不同时刻解析路径的浮点误差
+        cover = merge_intervals(cover, eps=1e-6)
+        intervals = clip_intervals_halfopen(cover, windows)
+        if lo is not None or hi is not None:
+            bounds = [(-float("inf") if lo is None else lo, float("inf") if hi is None else hi)]
+            intervals = clip_intervals_halfopen(intervals, bounds)
+        intervals = merge_intervals(intervals, eps=1e-6)
+        intervals = [(s, e) for s, e in intervals if e - s > self.min_duration]
+
+        segments = [
+            {
+                "start": _iso_z(datetime.fromtimestamp(s, timezone.utc)),
+                "end": _iso_z(datetime.fromtimestamp(e, timezone.utc)),
+                "duration_sec": round(e - s, 6),
+            }
+            for s, e in intervals
+        ]
+        total = round(sum(e - s for s, e in intervals), 6)
+
+        return {
+            "zone_id": zrow["zone_id"],
+            "crossed": bool(intervals),
+            "total_duration_sec": total,
+            "segments": segments,
         }

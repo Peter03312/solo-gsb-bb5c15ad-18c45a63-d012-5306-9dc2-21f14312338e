@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from .config import get_settings
 from .db import Database
 from .schemas import PointBatch, ZoneCreate
-from .service import AuditService, ConflictError, ValidationError
+from .service import AuditService, ConflictError, NotFoundError, ValidationError
 
 settings = get_settings()
 db = Database(settings)
@@ -26,11 +26,12 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="工地作业车危险区穿越审计服务",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
     description=(
-        "登记带洞米制多边形危险区及其 UTC 半开生效时段；批量提交车辆轨迹点，"
-        "查询各危险区的穿越区间与累计时长。"
+        "登记带洞米制多边形危险区及其 UTC 半开生效时段；每次登记原子产生全局递增修订号，"
+        "各区保留不可变历史版本。批量提交车辆轨迹点，按最新配置或指定修订号查询"
+        "各危险区的穿越区间与累计时长。"
     ),
 )
 
@@ -43,6 +44,11 @@ async def _validation_handler(_: Request, exc: ValidationError) -> JSONResponse:
 @app.exception_handler(ConflictError)
 async def _conflict_handler(_: Request, exc: ConflictError) -> JSONResponse:
     return JSONResponse(status_code=409, content={"error": "conflict", "detail": str(exc)})
+
+
+@app.exception_handler(NotFoundError)
+async def _not_found_handler(_: Request, exc: NotFoundError) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"error": "not_found", "detail": str(exc)})
 
 
 @app.get("/health")
@@ -60,6 +66,8 @@ def index() -> dict:
             "POST /api/v1/zones",
             "GET  /api/v1/zones",
             "GET  /api/v1/zones/{zone_id}",
+            "GET  /api/v1/revisions",
+            "GET  /api/v1/zones/{zone_id}/revisions",
             "POST /api/v1/trips/{trip_id}/points",
             "GET  /api/v1/trips/{trip_id}",
             "GET  /api/v1/trips/{trip_id}/crossings",
@@ -69,22 +77,60 @@ def index() -> dict:
 
 @app.post("/api/v1/zones", status_code=201)
 def create_zone(body: ZoneCreate) -> dict:
+    # 响应含本次登记原子产生的全局递增修订号 revision
     return service.register_zone(body.model_dump())
 
 
 @app.get("/api/v1/zones")
-def list_zones() -> dict:
-    return {"zones": service.list_zones()}
+def list_zones(
+    revision: Optional[int] = Query(
+        default=None,
+        ge=1,
+        description="可选修订号：返回各区截至该修订号的最后版本；省略则返回最新配置",
+    ),
+) -> dict:
+    return service.list_zones(revision)
 
 
 @app.get("/api/v1/zones/{zone_id}")
-def get_zone(zone_id: str) -> JSONResponse:
-    detail = service.get_zone(zone_id)
+def get_zone(
+    zone_id: str,
+    revision: Optional[int] = Query(
+        default=None,
+        ge=1,
+        description="可选修订号：返回该区截至该修订号的版本；省略则返回最新版本",
+    ),
+) -> JSONResponse:
+    try:
+        detail = service.get_zone(zone_id, revision)
+    except NotFoundError as exc:
+        return JSONResponse(
+            status_code=404, content={"error": "not_found", "detail": str(exc)}
+        )
     if detail is None:
         return JSONResponse(
             status_code=404, content={"error": "not_found", "detail": f"危险区不存在: {zone_id}"}
         )
     return JSONResponse(content=detail)
+
+
+@app.get("/api/v1/revisions")
+def list_revisions(
+    limit: int = Query(default=500, ge=1, le=10000, description="最多返回条数（按修订号倒序）"),
+) -> dict:
+    """全局修订流水：每次区域登记/覆盖更新产生一条。"""
+    return service.list_revisions(zone_id=None, limit=limit)
+
+
+@app.get("/api/v1/zones/{zone_id}/revisions")
+def list_zone_revisions(zone_id: str) -> JSONResponse:
+    """单个危险区的不可变修订历史（按修订号升序）。"""
+    try:
+        return JSONResponse(content=service.list_revisions(zone_id=zone_id))
+    except NotFoundError as exc:
+        return JSONResponse(
+            status_code=404, content={"error": "not_found", "detail": str(exc)}
+        )
 
 
 @app.post("/api/v1/trips/{trip_id}/points")
@@ -127,8 +173,18 @@ def get_crossings(
     zone_id: Optional[str] = Query(default=None),
     since: Optional[str] = Query(default=None, description="只统计该 UTC 时刻（含）之后"),
     until: Optional[str] = Query(default=None, description="只统计该 UTC 时刻（不含）之前"),
+    revision: Optional[int] = Query(
+        default=None,
+        ge=1,
+        description=(
+            "可选区域配置修订号：按各区截至该修订号的最后版本复现核算，"
+            "响应回填该 revision；省略则按最新配置，响应语义不变"
+        ),
+    ),
 ) -> dict:
-    return service.query_crossings(trip_id, zone_id=zone_id, since=since, until=until)
+    return service.query_crossings(
+        trip_id, zone_id=zone_id, since=since, until=until, revision_raw=revision
+    )
 
 
 if __name__ == "__main__":
